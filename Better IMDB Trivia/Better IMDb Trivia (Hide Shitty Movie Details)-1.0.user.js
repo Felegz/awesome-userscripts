@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Better IMDb Trivia (Hide Shitty Movie Details)
 // @namespace    https://github.com/Felegz/awesome-userscripts
-// @version      1.4
+// @version      1.5
 // @author       Felegz
 // @description  Silently hides poor IMDb trivia (Wilson score). Collects worst facts globally — open list via Tampermonkey menu.
 // @license      MIT
@@ -22,7 +22,7 @@
   const HIDDEN_ATTR         = 'data-trivia-hidden';
   const WILSON_HIDE_THRESHOLD = 0.55; // hide from page: statistically very bad
   const SAVE_MIN_DOWN       = 3;      // save to hall of shame: down > up AND down >= this
-  const MAX_STORED          = 500;
+  const MAX_STORED          = 400;
 
   // In-memory mirror of GM storage — loaded once at init
   let storedFacts = [];
@@ -58,11 +58,14 @@
       .tw-btn-close{background:none;border:none;color:#999;font-size:22px;cursor:pointer;line-height:1;padding:0 2px;}
       .tw-btn-close:hover{color:#fff;}
       .tw-list{overflow-y:auto;padding:0 18px;flex:1;}
-      .tw-item{padding:12px 0;border-bottom:1px solid #242424;}
+      .tw-item{padding:22px 0;border-bottom:1px solid #242424;}
       .tw-rank{font-size:11px;color:#555;margin-bottom:3px;}
-      .tw-movie{font-size:11px;color:#f5a623;margin-bottom:4px;}
-      .tw-text{font-size:13px;line-height:1.55;color:#ddd;}
-      .tw-votes{font-size:12px;color:#777;margin-top:5px;}
+      .tw-movie{font-size:12px;margin-bottom:6px;}
+      .tw-movie a{color:#f5a623;text-decoration:none;}
+      .tw-movie a:hover{text-decoration:underline;}
+      .tw-spoiler{color:#e03030;font-weight:bold;margin-left:8px;font-size:11px;letter-spacing:0.04em;}
+      .tw-text{font-size:13px;line-height:1.6;color:#ddd;display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden;}
+      .tw-votes{font-size:12px;color:#777;margin-top:6px;}
       .tw-empty{padding:40px;text-align:center;color:#555;font-size:14px;}
     `);
   }
@@ -125,6 +128,29 @@
     await gmSet(STORAGE_KEY, JSON.stringify(storedFacts));
   }
 
+  // Detect if a trivia item belongs to a spoiler section
+  function isSpoilerSection(item) {
+    // Check ancestor data-testid / id for "spoiler"
+    let el = item.parentElement;
+    while (el && el !== document.body) {
+      if (/spoiler/i.test(el.getAttribute('data-testid') || '') ||
+          /spoiler/i.test(el.getAttribute('id') || '')) return true;
+      el = el.parentElement;
+    }
+    // Walk up looking for a preceding sibling heading containing "spoiler"
+    el = item;
+    while (el && el !== document.body) {
+      let prev = el.previousElementSibling;
+      while (prev) {
+        if (/spoiler/i.test(prev.textContent || '') &&
+            /^H[2-4]$/.test(prev.tagName || '')) return true;
+        prev = prev.previousElementSibling;
+      }
+      el = el.parentElement;
+    }
+    return false;
+  }
+
   /*** Filtering (background, no UI) ***/
   function processItem(item, movieInfo) {
     if (!item || item.hasAttribute(PROCESSED_FLAG)) return;
@@ -173,6 +199,7 @@
             hash: hashText(text), text, up, down, wilson,
             movieId: movieInfo.movieId,
             movieTitle: movieInfo.movieTitle,
+            isSpoiler: isSpoilerSection(item),
             savedAt: Date.now()
           });
         }
@@ -207,7 +234,9 @@
             : top.map((d, i) => `
                 <div class="tw-item">
                   <div class="tw-rank">#${i + 1}</div>
-                  <div class="tw-movie">&#x1F3AC; ${escapeHtml(d.movieTitle || d.movieId)}</div>
+                  <div class="tw-movie">
+                    <a href="https://www.imdb.com/title/${escapeHtml(d.movieId)}/trivia/" target="_blank" rel="noopener">&#x1F3AC; ${escapeHtml(d.movieTitle || d.movieId)}</a>${d.isSpoiler ? ' <span class="tw-spoiler">⚠ SPOILER</span>' : ''}
+                  </div>
                   <div class="tw-text">${escapeHtml(d.text)}</div>
                   <div class="tw-votes">&#x1F44D; ${d.up} &nbsp; &#x1F44E; ${d.down} &nbsp; net: &#x2212;${d.down - d.up} &nbsp; wilson: ${(d.wilson * 100).toFixed(1)}%</div>
                 </div>`
