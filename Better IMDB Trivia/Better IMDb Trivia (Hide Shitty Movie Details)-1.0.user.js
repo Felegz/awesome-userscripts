@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Better IMDb Trivia (Hide Shitty Movie Details)
 // @namespace    https://github.com/Felegz/awesome-userscripts
-// @version      1.1
+// @version      1.2
 // @author       Felegz
-// @description  Hide IMDb trivia items where downvotes > upvotes. Works on /title/*/trivia pages and handles lazy loading.
+// @description  Hide IMDb trivia items with poor Wilson score (statistically disliked). Works on /title/*/trivia pages and handles lazy loading.
 // @license      MIT
 // @homepageURL  https://github.com/Felegz/awesome-userscripts
 // @match        https://www.imdb.com/title/*/trivia*
@@ -111,9 +111,12 @@
 
       const textNode = item.querySelector('.ipc-html-content-inner-div') || item.querySelector('p');
       const text = (textNode?.textContent || '').trim().slice(0, 400);
-      itemData.set(item, { up, down, text, wilson: wilsonDislike(up, down) });
+      const wilson = wilsonDislike(up, down);
+      itemData.set(item, { up, down, text, wilson });
 
-      if (enabled && down > up) {
+      // Wilson lower bound > 0.55: statistically confident that 55%+ of votes are dislikes.
+      // Requires enough votes to be meaningful — avoids hiding facts with just 1 downvote.
+      if (enabled && wilson > 0.55) {
         item.classList.add('trivia-hidden-by-script');
         item.setAttribute(HIDDEN_FLAG, '1');
       } else {
