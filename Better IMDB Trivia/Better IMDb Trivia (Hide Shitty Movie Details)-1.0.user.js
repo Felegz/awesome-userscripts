@@ -1,301 +1,250 @@
 // ==UserScript==
 // @name         Better IMDb Trivia (Hide Shitty Movie Details)
 // @namespace    https://github.com/Felegz/awesome-userscripts
-// @version      1.2
+// @version      1.3
 // @author       Felegz
-// @description  Hide IMDb trivia items with poor Wilson score (statistically disliked). Works on /title/*/trivia pages and handles lazy loading.
+// @description  Silently hides poor IMDb trivia (Wilson score). Collects worst facts globally — open list via Tampermonkey menu.
 // @license      MIT
 // @homepageURL  https://github.com/Felegz/awesome-userscripts
 // @match        https://www.imdb.com/title/*/trivia*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
 
 /* eslint-disable no-console */
 (function () {
   'use strict';
 
-  const ENABLE_KEY = 'imdb_trivia_hider_enabled_v1';
-  const HIDDEN_FLAG = 'data-trivia-hidden-by-script';
-  const PROCESSED_FLAG = 'data-trivia-processed-by-script';
-  const itemData = new Map(); // element -> { up, down, text, wilson }
+  const STORAGE_KEY      = 'imdb_worst_facts_v1';
+  const PROCESSED_FLAG   = 'data-trivia-processed';
+  const HIDDEN_ATTR      = 'data-trivia-hidden';
+  const WILSON_THRESHOLD = 0.55;
+  const MAX_STORED       = 500;
 
-  /****************** utilities for GM_getValue compatibility ******************/
-  function gmGet(key, defaultValue) {
+  // In-memory mirror of GM storage — loaded once at init
+  let storedFacts = [];
+  const processedHashes = new Set(); // fact text hashes already in storage
+
+  /*** GM helpers ***/
+  function gmGet(key, def) {
     try {
-      const r = (typeof GM_getValue === 'function') ? GM_getValue(key) : undefined;
-      // GM_getValue may return a Promise in some environments; handle both
-      if (r && typeof r.then === 'function') return r.then(v => (v === undefined ? defaultValue : v));
-      return Promise.resolve((r === undefined) ? defaultValue : r);
-    } catch (e) {
-      return Promise.resolve(defaultValue);
-    }
+      const r = typeof GM_getValue === 'function' ? GM_getValue(key) : undefined;
+      if (r && typeof r.then === 'function') return r.then(v => (v === undefined ? def : v));
+      return Promise.resolve(r === undefined ? def : r);
+    } catch { return Promise.resolve(def); }
   }
   function gmSet(key, value) {
     try {
-      const r = (typeof GM_setValue === 'function') ? GM_setValue(key, value) : undefined;
+      const r = typeof GM_setValue === 'function' ? GM_setValue(key, value) : undefined;
       if (r && typeof r.then === 'function') return r;
       return Promise.resolve();
-    } catch (e) {
-      return Promise.resolve();
-    }
+    } catch { return Promise.resolve(); }
   }
-  /***************************************************************************/
 
-  // CSS to hide items and style panel
+  /*** CSS: silent hide + modal ***/
   if (typeof GM_addStyle === 'function') {
     GM_addStyle(`
-      .trivia-hidden-by-script{display:none !important;opacity:0 !important;height:0 !important;margin:0 !important;padding:0 !important;border:0 !important;}
-      .trivia-hider-panel{
-        position:fixed; right:12px; bottom:12px; z-index:2147483647;
-        background:rgba(20,20,20,0.94); color:#fff; padding:8px 10px; border-radius:8px;
-        font-family:Arial,Helvetica,sans-serif; font-size:13px; box-shadow:0 6px 18px rgba(0,0,0,0.4);
-      }
-      .trivia-hider-panel button, .trivia-hider-panel input[type="checkbox"]{cursor:pointer; margin-left:6px;}
-      .trivia-hider-panel .label {margin-right:6px;}
-      .trivia-top50-overlay{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,0.75);display:flex;align-items:center;justify-content:center;}
-      .trivia-top50-modal{background:#1a1a1a;color:#e8e8e8;border-radius:10px;width:700px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.8);}
-      .trivia-top50-header{padding:14px 18px;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center;font-size:15px;}
-      .trivia-top50-close{background:none;border:none;color:#aaa;font-size:20px;cursor:pointer;padding:0 4px;line-height:1;}
-      .trivia-top50-close:hover{color:#fff;}
-      .trivia-top50-list{overflow-y:auto;padding:0 18px;flex:1;}
-      .trivia-top50-item{padding:12px 0;border-bottom:1px solid #242424;}
-      .trivia-top50-rank{font-size:11px;color:#666;margin-bottom:4px;}
-      .trivia-top50-text{font-size:13px;line-height:1.5;color:#ddd;}
-      .trivia-top50-votes{font-size:12px;color:#888;margin-top:6px;}
+      [data-trivia-hidden="1"]{display:none !important;}
+      .tw-overlay{position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;}
+      .tw-modal{background:#1a1a1a;color:#e8e8e8;border-radius:10px;width:720px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.85);font-family:Arial,Helvetica,sans-serif;}
+      .tw-header{padding:14px 18px;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center;font-size:15px;gap:8px;}
+      .tw-header-title{flex:1;}
+      .tw-header-actions{display:flex;align-items:center;gap:8px;}
+      .tw-btn-clear{background:#5a1111;border:none;color:#fff;font-size:12px;border-radius:4px;padding:4px 10px;cursor:pointer;white-space:nowrap;}
+      .tw-btn-clear:hover{background:#7a1515;}
+      .tw-btn-close{background:none;border:none;color:#999;font-size:22px;cursor:pointer;line-height:1;padding:0 2px;}
+      .tw-btn-close:hover{color:#fff;}
+      .tw-list{overflow-y:auto;padding:0 18px;flex:1;}
+      .tw-item{padding:12px 0;border-bottom:1px solid #242424;}
+      .tw-rank{font-size:11px;color:#555;margin-bottom:3px;}
+      .tw-movie{font-size:11px;color:#f5a623;margin-bottom:4px;}
+      .tw-text{font-size:13px;line-height:1.55;color:#ddd;}
+      .tw-votes{font-size:12px;color:#777;margin-top:5px;}
+      .tw-empty{padding:40px;text-align:center;color:#555;font-size:14px;}
     `);
   }
 
-  // parse integer from a node (strip non-digits)
+  /*** Utilities ***/
   function parseCount(node) {
     if (!node) return null;
-    const t = node.textContent || '';
-    const digits = t.replace(/[^\d]/g, '');
-    return digits.length ? parseInt(digits, 10) : 0;
+    const d = (node.textContent || '').replace(/[^\d]/g, '');
+    return d.length ? parseInt(d, 10) : 0;
   }
 
-  // Wilson score lower bound on dislike ratio (95% CI) — naturally handles small sample sizes
   function wilsonDislike(up, down) {
     const n = up + down;
     if (n === 0) return 0;
-    const z = 1.96;
-    const p = down / n;
-    return (p + z * z / (2 * n) - z * Math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)) / (1 + z * z / n);
+    const z = 1.96, p = down / n;
+    return (p + z*z/(2*n) - z*Math.sqrt((p*(1-p) + z*z/(4*n))/n)) / (1 + z*z/n);
   }
 
-  function escapeHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  // process single trivia item element
-  function processItem(item, enabled) {
+  // djb2 hash — dedup key for stored facts
+  function hashText(s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+    return (h >>> 0).toString(36);
+  }
+
+  function getMovieInfo() {
+    const m = location.pathname.match(/\/title\/(tt\d+)\//);
+    const movieId = m ? m[1] : 'unknown';
+    const titleEl = document.querySelector('h1[data-testid="hero__pageTitle"] span') || document.querySelector('h1');
+    const movieTitle = titleEl ? titleEl.textContent.trim() : document.title.split(' - ')[0].trim();
+    return { movieId, movieTitle };
+  }
+
+  /*** Persistent storage ***/
+  async function initStorage() {
+    const raw = await gmGet(STORAGE_KEY, '[]');
+    try { storedFacts = JSON.parse(raw) || []; } catch { storedFacts = []; }
+    // Populate in-memory hash set to detect duplicates without re-reading storage
+    storedFacts.forEach(f => processedHashes.add(f.hash));
+  }
+
+  async function saveFactIfNew(fact) {
+    if (processedHashes.has(fact.hash)) return; // already stored — skip
+    processedHashes.add(fact.hash);
+    storedFacts.push(fact);
+    // If over limit, keep the worst MAX_STORED by Wilson score
+    if (storedFacts.length > MAX_STORED) {
+      storedFacts.sort((a, b) => b.wilson - a.wilson);
+      storedFacts.splice(MAX_STORED);
+      // Rebuild hash set after eviction (some facts may have been dropped)
+      processedHashes.clear();
+      storedFacts.forEach(f => processedHashes.add(f.hash));
+    }
+    await gmSet(STORAGE_KEY, JSON.stringify(storedFacts));
+  }
+
+  /*** Filtering (background, no UI) ***/
+  function processItem(item, movieInfo) {
     if (!item || item.hasAttribute(PROCESSED_FLAG)) return;
     item.setAttribute(PROCESSED_FLAG, '1');
     try {
-      const upNode = item.querySelector('.ipc-voting__label__count--up');
+      const upNode   = item.querySelector('.ipc-voting__label__count--up');
       const downNode = item.querySelector('.ipc-voting__label__count--down');
-
-      // if neither exists, nothing to do
       if (!upNode && !downNode) return;
 
-      const up = parseCount(upNode);
-      const down = parseCount(downNode);
-
-      // if parsing failed (null) — don't hide
+      const up = parseCount(upNode), down = parseCount(downNode);
       if (up === null || down === null) return;
 
-      const textNode = item.querySelector('.ipc-html-content-inner-div') || item.querySelector('p');
-      const text = (textNode?.textContent || '').trim().slice(0, 400);
       const wilson = wilsonDislike(up, down);
-      itemData.set(item, { up, down, text, wilson });
-
-      // Wilson lower bound > 0.55: statistically confident that 55%+ of votes are dislikes.
-      // Requires enough votes to be meaningful — avoids hiding facts with just 1 downvote.
-      if (enabled && wilson > 0.55) {
-        item.classList.add('trivia-hidden-by-script');
-        item.setAttribute(HIDDEN_FLAG, '1');
+      if (wilson > WILSON_THRESHOLD) {
+        item.setAttribute(HIDDEN_ATTR, '1');
+        const textNode = item.querySelector('.ipc-html-content-inner-div') || item.querySelector('p');
+        const text = (textNode?.textContent || '').trim().slice(0, 500);
+        if (text) {
+          // Fire-and-forget — save asynchronously, no need to block rendering
+          saveFactIfNew({
+            hash: hashText(text), text, up, down, wilson,
+            movieId: movieInfo.movieId,
+            movieTitle: movieInfo.movieTitle,
+            savedAt: Date.now()
+          });
+        }
       } else {
-        item.classList.remove('trivia-hidden-by-script');
-        item.removeAttribute(HIDDEN_FLAG);
+        // Ensure item is visible if it no longer qualifies (e.g. after re-scan)
+        item.removeAttribute(HIDDEN_ATTR);
       }
-    } catch (err) {
-      console.error('trivia-hider: processItem error', err);
-    }
+    } catch (e) { console.error('trivia-hider:', e); }
   }
 
-  // scan all trivia items on page
-  function scanAll(enabled) {
-    try {
-      const items = document.querySelectorAll('[data-testid="item-id"]');
-      if (!items || items.length === 0) return;
-      items.forEach(item => processItem(item, enabled));
-    } catch (e) {
-      console.error('trivia-hider: scanAll error', e);
-    }
+  function scanAll() {
+    const movieInfo = getMovieInfo();
+    document.querySelectorAll('[data-testid="item-id"]').forEach(item => processItem(item, movieInfo));
   }
 
-  // show modal with top 50 most disliked trivia facts (sorted by net dislike score)
-  function showTop50Modal() {
-    const entries = Array.from(itemData.entries())
-      .filter(([el]) => document.body.contains(el))
-      .map(([, d]) => d)
-      .filter(d => d.down > 0)
-      .sort((a, b) => (b.down - b.up) - (a.down - a.up))
-      .slice(0, 50);
-
-    if (entries.length === 0) {
-      alert('No disliked facts found yet. Try clicking Scan first.');
-      return;
-    }
+  /*** Modal (opened via Tampermonkey menu) ***/
+  function showWorstFactsModal() {
+    // Sort in-memory facts by Wilson score descending, show top 50
+    const top = [...storedFacts].sort((a, b) => b.wilson - a.wilson).slice(0, 50);
 
     const overlay = document.createElement('div');
-    overlay.className = 'trivia-top50-overlay';
+    overlay.className = 'tw-overlay';
     overlay.innerHTML = `
-      <div class="trivia-top50-modal">
-        <div class="trivia-top50-header">
-          <strong>Top ${entries.length} most disliked facts</strong>
-          <button class="trivia-top50-close">&#x2715;</button>
+      <div class="tw-modal">
+        <div class="tw-header">
+          <span class="tw-header-title">Top ${top.length} worst trivia facts (all time, ${storedFacts.length} stored)</span>
+          <span class="tw-header-actions">
+            <button class="tw-btn-clear">Clear all</button>
+            <button class="tw-btn-close">&#x2715;</button>
+          </span>
         </div>
-        <div class="trivia-top50-list">
-          ${entries.map((d, i) => `
-            <div class="trivia-top50-item">
-              <div class="trivia-top50-rank">#${i + 1}</div>
-              <div class="trivia-top50-text">${escapeHtml(d.text || '(no text extracted)')}</div>
-              <div class="trivia-top50-votes">&#x1F44D; ${d.up} &nbsp;&nbsp; &#x1F44E; ${d.down} &nbsp;&nbsp; net: &#x2212;${d.down - d.up} &nbsp;&nbsp; wilson: ${(d.wilson * 100).toFixed(1)}%</div>
-            </div>
-          `).join('')}
+        <div class="tw-list">
+          ${top.length === 0
+            ? '<div class="tw-empty">No facts collected yet — browse some IMDb trivia pages!</div>'
+            : top.map((d, i) => `
+                <div class="tw-item">
+                  <div class="tw-rank">#${i + 1}</div>
+                  <div class="tw-movie">&#x1F3AC; ${escapeHtml(d.movieTitle || d.movieId)}</div>
+                  <div class="tw-text">${escapeHtml(d.text)}</div>
+                  <div class="tw-votes">&#x1F44D; ${d.up} &nbsp; &#x1F44E; ${d.down} &nbsp; net: &#x2212;${d.down - d.up} &nbsp; wilson: ${(d.wilson * 100).toFixed(1)}%</div>
+                </div>`
+            ).join('')}
         </div>
       </div>
     `;
-    overlay.querySelector('.trivia-top50-close').addEventListener('click', () => overlay.remove());
+
+    overlay.querySelector('.tw-btn-close').addEventListener('click', () => overlay.remove());
     overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelector('.tw-btn-clear').addEventListener('click', async () => {
+      if (!confirm('Clear all stored worst-trivia facts? This cannot be undone.')) return;
+      storedFacts = [];
+      processedHashes.clear();
+      await gmSet(STORAGE_KEY, '[]');
+      overlay.remove();
+    });
+
     document.body.appendChild(overlay);
   }
 
-  // create floating control panel
-  function createPanel(initialEnabled) {
-    const panel = document.createElement('div');
-    panel.className = 'trivia-hider-panel';
-    panel.innerHTML = `
-      <span class="label">Trivia Hider</span>
-      <label title="Hide items where dislikes &gt; likes">
-        <input type="checkbox" id="trivia-hider-toggle"> Вкл
-      </label>
-      <button id="trivia-hider-reveal" title="Toggle visibility of currently hidden items">Показать/скрыть скрытые</button>
-      <button id="trivia-hider-scan" title="Re-scan page">Scan</button>
-      <button id="trivia-hider-top50" title="Show top 50 most disliked facts">Top 50</button>
-    `;
-    // add to DOM after body exists
-    const appendPanel = () => { document.body.appendChild(panel); attachPanelHandlers(panel); };
-    if (document.body) appendPanel(); else window.addEventListener('DOMContentLoaded', appendPanel);
-
-    // set initial checkbox state
-    // attachPanelHandlers will set the actual checked state
-    return panel;
-  }
-
-  function attachPanelHandlers(panel) {
-    const cb = panel.querySelector('#trivia-hider-toggle');
-    const btnReveal = panel.querySelector('#trivia-hider-reveal');
-    const btnScan = panel.querySelector('#trivia-hider-scan');
-
-    // restore state and set checkbox
-    gmGet(ENABLE_KEY, true).then(enabled => {
-      cb.checked = Boolean(enabled);
-      // initial scan once checkbox set
-      scanAll(Boolean(enabled));
-    });
-
-    cb.addEventListener('change', async () => {
-      const enabled = Boolean(cb.checked);
-      await gmSet(ENABLE_KEY, enabled);
-      // re-scan and apply/hide accordingly
-      // remove processed flags so items will be re-checked (in case conditions changed)
-      document.querySelectorAll('[data-testid="item-id"]').forEach(it => it.removeAttribute(PROCESSED_FLAG));
-      scanAll(enabled);
-    });
-
-    btnReveal.addEventListener('click', () => {
-      // toggle visibility of hidden items
-      const hidden = document.querySelectorAll(`[${HIDDEN_FLAG}="1"]`);
-      if (!hidden || hidden.length === 0) {
-        // brief feedback by toggling scan to make hidden visible then mark them as visible
-        alert('Скрытых фактов пока нет.');
-        return;
-      }
-      // if currently hidden (have class), remove class to show; if shown, add class to hide
-      const anyHiddenShown = Array.from(hidden).some(el => el.classList.contains('trivia-hidden-by-script'));
-      hidden.forEach(el => {
-        if (anyHiddenShown) el.classList.remove('trivia-hidden-by-script');
-        else el.classList.add('trivia-hidden-by-script');
-      });
-    });
-
-    btnScan.addEventListener('click', async () => {
-      const enabled = await gmGet(ENABLE_KEY, true);
-      // clear processed flags to force re-evaluation
-      document.querySelectorAll('[data-testid="item-id"]').forEach(it => it.removeAttribute(PROCESSED_FLAG));
-      scanAll(Boolean(enabled));
-    });
-
-    const btnTop50 = panel.querySelector('#trivia-hider-top50');
-    btnTop50.addEventListener('click', () => showTop50Modal());
-  }
-
-  // observe DOM for new trivia items (handles lazy loading / "show more")
-  function startObserver(enabledRef) {
-    let scanTimer = null;
-    const observer = new MutationObserver((mutations) => {
-      let needScan = false;
-      for (const m of mutations) {
-        if (m.addedNodes && m.addedNodes.length) {
-          // quick check: if any added node contains a trivia item
-          for (const n of m.addedNodes) {
-            if (n.nodeType !== 1) continue;
-            if (n.matches && n.matches('[data-testid="item-id"]')) { needScan = true; break; }
-            if (n.querySelector && n.querySelector('[data-testid="item-id"]')) { needScan = true; break; }
+  /*** Observer (debounced) ***/
+  function startObserver() {
+    let timer = null;
+    new MutationObserver(mutations => {
+      let hit = false;
+      outer: for (const m of mutations) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if (n.matches?.('[data-testid="item-id"]') || n.querySelector?.('[data-testid="item-id"]')) {
+            hit = true; break outer;
           }
         }
       }
-      if (needScan) {
-        // debounced timeout — one timer for any burst of DOM mutations
-        clearTimeout(scanTimer);
-        scanTimer = setTimeout(() => {
-          gmGet(ENABLE_KEY, true).then(enabled => scanAll(Boolean(enabled)));
-        }, 300);
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-    return observer;
+      if (hit) { clearTimeout(timer); timer = setTimeout(scanAll, 300); }
+    }).observe(document.body, { childList: true, subtree: true });
   }
 
-  // init
+  /*** Init ***/
   (async function init() {
-    const enabled = await gmGet(ENABLE_KEY, true);
+    // Load stored facts into memory before any scanning begins
+    await initStorage();
 
-    // create panel and attach
-    createPanel(enabled);
+    // Register Tampermonkey menu item — user opens modal by clicking the TM icon
+    if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand('Show worst trivia facts (Top 50)', showWorstFactsModal);
+    }
 
-    // initial scans with small delays (IMDB might fill numbers after render)
-    scanAll(enabled);
-    setTimeout(() => scanAll(enabled), 900);
-    setTimeout(() => scanAll(enabled), 2500);
+    // Scan with delays to account for IMDb’s async vote counter rendering
+    scanAll();
+    setTimeout(scanAll, 900);
+    setTimeout(scanAll, 2500);
 
-    // start observer
     startObserver();
 
-    // also re-scan on navigation events (IMDB uses PJAX-ish navigation)
+    // Re-scan after PJAX navigation (new movie page)
     window.addEventListener('popstate', () => {
-      gmGet(ENABLE_KEY, true).then(e => {
-        // clear processed flags and re-scan
-        document.querySelectorAll('[data-testid="item-id"]').forEach(it => it.removeAttribute(PROCESSED_FLAG));
-        scanAll(Boolean(e));
-      });
+      document.querySelectorAll('[data-testid="item-id"]')
+        .forEach(it => it.removeAttribute(PROCESSED_FLAG));
+      setTimeout(scanAll, 400);
     });
   })();
 
