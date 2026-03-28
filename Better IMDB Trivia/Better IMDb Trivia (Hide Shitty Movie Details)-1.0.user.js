@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Better IMDb Trivia (Hide Shitty Movie Details)
 // @namespace    https://github.com/Felegz/awesome-userscripts
-// @version      1.5
+// @version      1.6
 // @author       Felegz
 // @description  Silently hides poor IMDb trivia (Wilson score). Collects worst facts globally — open list via Tampermonkey menu.
 // @license      MIT
@@ -100,9 +100,32 @@
   function getMovieInfo() {
     const m = location.pathname.match(/\/title\/(tt\d+)\//);
     const movieId = m ? m[1] : 'unknown';
-    const titleEl = document.querySelector('h1[data-testid="hero__pageTitle"] span') || document.querySelector('h1');
-    const movieTitle = titleEl ? titleEl.textContent.trim() : document.title.split(' - ')[0].trim();
-    return { movieId, movieTitle };
+
+    // 1. og:title — most reliable, present on all IMDb pages including /trivia/
+    //    Format: "Movie Name (Year) - IMDb" or just "Movie Name"
+    const ogTitle = document.querySelector('meta[property="og:title"]')?.content;
+    if (ogTitle) {
+      return { movieId, movieTitle: ogTitle.replace(/\s*-\s*IMDb\s*$/i, '').trim() };
+    }
+
+    // 2. Sub-page header link (IMDb trivia/subpages often have a link back to the movie)
+    const subLink = document.querySelector('[data-testid="sub-page-title-link"]');
+    if (subLink?.textContent) {
+      return { movieId, movieTitle: subLink.textContent.trim() };
+    }
+
+    // 3. Breadcrumb / hero title selectors used on the main movie page
+    const heroEl =
+      document.querySelector('[data-testid="hero-title-block__title"]') ||
+      document.querySelector('h1[data-testid="hero__pageTitle"] span');
+    if (heroEl?.textContent) {
+      return { movieId, movieTitle: heroEl.textContent.trim() };
+    }
+
+    // 4. document.title — format: "Movie Name (Year) - Trivia - IMDb"
+    //    Strip everything from the first " - " that is followed by Trivia/IMDb/etc.
+    const fromTitle = document.title.replace(/\s*-\s*(Trivia|IMDb).*$/i, '').trim();
+    return { movieId, movieTitle: fromTitle || movieId };
   }
 
   /*** Persistent storage ***/
