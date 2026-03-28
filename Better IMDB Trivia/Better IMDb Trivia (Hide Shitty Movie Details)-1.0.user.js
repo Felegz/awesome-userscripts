@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Better IMDb Trivia (Hide Shitty Movie Details)
 // @namespace    https://github.com/Felegz/awesome-userscripts
-// @version      1.3
+// @version      1.4
 // @author       Felegz
 // @description  Silently hides poor IMDb trivia (Wilson score). Collects worst facts globally — open list via Tampermonkey menu.
 // @license      MIT
@@ -17,11 +17,12 @@
 (function () {
   'use strict';
 
-  const STORAGE_KEY      = 'imdb_worst_facts_v1';
-  const PROCESSED_FLAG   = 'data-trivia-processed';
-  const HIDDEN_ATTR      = 'data-trivia-hidden';
-  const WILSON_THRESHOLD = 0.55;
-  const MAX_STORED       = 500;
+  const STORAGE_KEY         = 'imdb_worst_facts_v1';
+  const PROCESSED_FLAG      = 'data-trivia-processed';
+  const HIDDEN_ATTR         = 'data-trivia-hidden';
+  const WILSON_HIDE_THRESHOLD = 0.55; // hide from page: statistically very bad
+  const SAVE_MIN_DOWN       = 3;      // save to hall of shame: down > up AND down >= this
+  const MAX_STORED          = 500;
 
   // In-memory mirror of GM storage — loaded once at init
   let storedFacts = [];
@@ -127,22 +128,47 @@
   /*** Filtering (background, no UI) ***/
   function processItem(item, movieInfo) {
     if (!item || item.hasAttribute(PROCESSED_FLAG)) return;
-    item.setAttribute(PROCESSED_FLAG, '1');
     try {
       const upNode   = item.querySelector('.ipc-voting__label__count--up');
       const downNode = item.querySelector('.ipc-voting__label__count--down');
-      if (!upNode && !downNode) return;
+
+      // No vote UI at all — mark done and skip
+      if (!upNode && !downNode) {
+        item.setAttribute(PROCESSED_FLAG, '1');
+        return;
+      }
 
       const up = parseCount(upNode), down = parseCount(downNode);
-      if (up === null || down === null) return;
+
+      // Parsing error — mark done and skip
+      if (up === null || down === null) {
+        item.setAttribute(PROCESSED_FLAG, '1');
+        return;
+      }
+
+      // Votes not loaded yet (IMDb renders them async) — leave unprocessed for next scan
+      if (up === 0 && down === 0) return;
+
+      // Votes are present — mark as processed so we don't re-process
+      item.setAttribute(PROCESSED_FLAG, '1');
 
       const wilson = wilsonDislike(up, down);
-      if (wilson > WILSON_THRESHOLD) {
+
+      // --- Hide from page ---
+      if (wilson > WILSON_HIDE_THRESHOLD) {
         item.setAttribute(HIDDEN_ATTR, '1');
+      } else {
+        item.removeAttribute(HIDDEN_ATTR);
+      }
+
+      // --- Save to hall of shame ---
+      // Criterion: more dislikes than likes AND at least SAVE_MIN_DOWN dislikes.
+      // Deliberately separate from the hide threshold so we collect more data.
+      // Note: a fact like 175 up / 110 down will NOT be saved (down < up).
+      if (down > up && down >= SAVE_MIN_DOWN) {
         const textNode = item.querySelector('.ipc-html-content-inner-div') || item.querySelector('p');
         const text = (textNode?.textContent || '').trim().slice(0, 500);
         if (text) {
-          // Fire-and-forget — save asynchronously, no need to block rendering
           saveFactIfNew({
             hash: hashText(text), text, up, down, wilson,
             movieId: movieInfo.movieId,
@@ -150,9 +176,6 @@
             savedAt: Date.now()
           });
         }
-      } else {
-        // Ensure item is visible if it no longer qualifies (e.g. after re-scan)
-        item.removeAttribute(HIDDEN_ATTR);
       }
     } catch (e) { console.error('trivia-hider:', e); }
   }
